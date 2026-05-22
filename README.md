@@ -1,5 +1,9 @@
 # eventstream
 
+[![ci](https://github.com/pilot-protocol/eventstream/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/eventstream/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/eventstream/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/eventstream)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Pub/sub event delivery plugin for the Pilot Protocol daemon. Binds
 service port 1002 and ships events between Pilot peers over the
 daemon's reliable stream transport.
@@ -57,3 +61,7 @@ pilotctl publish   <peer-address> ticker.btcusd --data '...'
 | Tag | Effect |
 |---|---|
 | `no_eventstream` | Compiles a no-op stub service. |
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
