@@ -7,8 +7,8 @@ import (
 	"net"
 	"sync"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/driver"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Server is a pub/sub event broker on port 1002.

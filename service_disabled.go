@@ -13,7 +13,7 @@ package eventstream
 import (
 	"context"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // Service is a no-op replacement for the real plugin Service.

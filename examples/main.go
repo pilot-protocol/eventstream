@@ -8,8 +8,8 @@ import (
 	"log"
 
 	internales "github.com/pilot-protocol/eventstream"
-	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/driver"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 func main() {
