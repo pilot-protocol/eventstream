@@ -97,24 +97,42 @@ func (s *Server) removeSub(conn net.Conn) {
 	}
 }
 
+// publish fan-outs evt to every subscriber on evt.Topic and "*" (minus
+// the sender). The subscriber set is snapshotted under a brief RLock
+// and the lock is released before any WriteEvent I/O — otherwise a slow
+// subscriber (full pipe / TCP send buffer) would block WriteEvent while
+// the RLock is still held, starving every concurrent addSub/removeSub
+// caller waiting on mu.Lock(). See broker.publishWith in service.go for
+// the same pattern (P2-003).
 func (s *Server) publish(evt *Event, sender net.Conn) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Send to topic-specific subscribers
+	targets := make([]net.Conn, 0, len(s.subs[evt.Topic])+len(s.subs["*"]))
 	for _, conn := range s.subs[evt.Topic] {
 		if conn != sender {
-			WriteEvent(conn, evt)
+			targets = append(targets, conn)
 		}
 	}
-	// Send to wildcard subscribers
 	if evt.Topic != "*" {
 		for _, conn := range s.subs["*"] {
 			if conn != sender {
-				WriteEvent(conn, evt)
+				targets = append(targets, conn)
 			}
 		}
 	}
+	s.mu.RUnlock()
 
-	slog.Debug("eventstream published", "topic", evt.Topic, "bytes", len(evt.Payload), "from", sender.RemoteAddr())
+	for _, conn := range targets {
+		if err := WriteEvent(conn, evt); err != nil {
+			slog.Debug("eventstream write failed",
+				"remote", conn.RemoteAddr(),
+				"topic", evt.Topic,
+				"error", err)
+		}
+	}
+
+	slog.Debug("eventstream published",
+		"topic", evt.Topic,
+		"bytes", len(evt.Payload),
+		"from", sender.RemoteAddr(),
+		"targets", len(targets))
 }
