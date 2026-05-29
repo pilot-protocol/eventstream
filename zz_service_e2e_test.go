@@ -115,7 +115,7 @@ func TestService_AcceptLoopAndPubSub(t *testing.T) {
 	pubStream := newSinkStream(pubC2sR)
 
 	listener := newESListener(subStream, pubStream)
-	deps := coreapi.Deps{Streams: &esFakeStreams{ln: listener}}
+	deps := coreapi.Deps{Streams: &esFakeStreams{ln: listener}, Trust: newAllowAllTrustChecker()}
 
 	s := NewService()
 	if err := s.Start(context.Background(), deps); err != nil {

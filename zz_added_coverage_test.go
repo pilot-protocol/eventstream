@@ -63,6 +63,31 @@ func (s *stubEventBus) count(topic string) int {
 	return n
 }
 
+// --- stub TrustChecker -------------------------------------------------------
+
+// stubTrustChecker is a TrustChecker that trusts (or denies) a configurable
+// set of node IDs. Used by broker handleConn tests that exercise the
+// subscribe/publish path — the trust gate must pass for those tests to
+// reach the code under test.
+type stubTrustChecker struct {
+	trusted  map[uint32]bool
+	allowAll bool
+}
+
+func newAllowAllTrustChecker() *stubTrustChecker {
+	return &stubTrustChecker{allowAll: true}
+}
+
+func (t *stubTrustChecker) IsTrusted(nodeID uint32) (string, bool) {
+	if t.allowAll {
+		return "test-agent", true
+	}
+	if t.trusted != nil && t.trusted[nodeID] {
+		return "test-agent", true
+	}
+	return "", false
+}
+
 // --- net.Pipe-backed coreapi.Stream -----------------------------------------
 
 // pipeStream adapts net.Pipe to coreapi.Stream so we can drive broker
@@ -100,7 +125,7 @@ func (s *pipeStream) SetWriteDeadline(time.Time) error { return nil }
 func TestBroker_HandleConn_SubscribeEmitsEvent(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, newAllowAllTrustChecker())
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -153,7 +178,7 @@ func TestBroker_HandleConn_SubscribeEmitsEvent(t *testing.T) {
 func TestBroker_HandleConn_SubscribeReadFails(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, newAllowAllTrustChecker())
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -190,7 +215,7 @@ func TestBroker_HandleConn_SubscribeReadFails(t *testing.T) {
 func TestBroker_HandleConn_PublishedEventBusBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, newAllowAllTrustChecker())
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -248,7 +273,7 @@ func TestBroker_HandleConn_PublishedEventBusBranch(t *testing.T) {
 func TestBroker_HandleConn_RateLimitBusBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, newAllowAllTrustChecker())
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -315,7 +340,7 @@ func TestBroker_HandleConn_RateLimitBusBranch(t *testing.T) {
 // (lines 312-315 — wildcard subscriber receives non-wildcard event).
 func TestPublishWith_WildcardFanout(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 
 	topicSub := stubSubscriber()
 	wildSub := stubSubscriber()
@@ -348,7 +373,7 @@ func TestPublishWith_WildcardFanout(t *testing.T) {
 // should not receive its own publish.
 func TestPublishWith_WildcardSenderSkipped(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 
 	wildSender := stubSubscriber()
 	wildOther := stubSubscriber()
@@ -381,7 +406,7 @@ func TestPublishWith_WildcardSenderSkipped(t *testing.T) {
 // otherwise double-deliver).
 func TestPublishWith_TopicIsWildcardDoesNotDoubleDeliver(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	wildSub := stubSubscriber()
 	b.addSub("*", wildSub)
 
@@ -408,7 +433,7 @@ func TestPublishWith_TopicIsWildcardDoesNotDoubleDeliver(t *testing.T) {
 func TestPublishWith_BusPublishedBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, nil)
 	sub := stubSubscriber()
 	b.addSub("t", sub)
 
@@ -452,7 +477,7 @@ func TestService_StopContextCancel(t *testing.T) {
 // so it must be clamped.
 func TestTakeToken_RefillCappedAtBurst(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	sub := stubSubscriber()
 
 	// Seed a bucket with a lastRefill far in the past so the elapsed
@@ -672,5 +697,44 @@ func TestServer_Publish_TopicLiteralStar(t *testing.T) {
 		t.Errorf("unexpected second delivery: %+v err=%v", r.ev, r.err)
 	case <-time.After(150 * time.Millisecond):
 		// expected — no second delivery.
+	}
+}
+
+// TestBroker_HandleConn_SubscriptionRejectedByTrustGate covers PILOT-251:
+// when a TrustChecker is present and the peer is NOT trusted, handleConn
+// must reject the subscription immediately without adding to subs.
+func TestBroker_HandleConn_SubscriptionRejectedByTrustGate(t *testing.T) {
+	t.Parallel()
+
+	// Trust checker that trusts nobody.
+	denyAll := &stubTrustChecker{trusted: map[uint32]bool{}}
+	b := newBroker(nil, denyAll)
+
+	subStream, clientEnd := newPipeStreamPair()
+	sub := newSubscriber(subStream)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.handleConn(sub)
+	}()
+
+	// Write a subscribe event — should be rejected.
+	if err := WriteEvent(clientEnd, &Event{Topic: "secret"}); err != nil {
+		t.Fatalf("WriteEvent subscribe: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not return after trust rejection")
+	}
+
+	// Verify the subscription was NOT registered.
+	b.mu.RLock()
+	n := len(b.subs["secret"])
+	b.mu.RUnlock()
+	if n != 0 {
+		t.Errorf("subscription should not be registered when trust check fails, got %d subs", n)
 	}
 }
