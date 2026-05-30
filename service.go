@@ -35,6 +35,7 @@ const (
 const (
 	publishRetryBackoff           = 20 * time.Millisecond
 	maxConsecutivePublishFailures = 3
+	publishWriteTimeout           = 5 * time.Second
 )
 
 // Service is the L11 plugin adapter. cmd/daemon/main.go (L12) and
@@ -317,31 +318,58 @@ func (b *broker) publishWith(evt *Event, sender *subscriber, write eventWriter) 
 	}
 	b.mu.RUnlock()
 
-	var dead []*subscriber
+	var (
+		wg     sync.WaitGroup
+		deadMu sync.Mutex
+		dead   []*subscriber
+	)
 	for _, s := range targets {
-		err := write(s, evt)
-		if err != nil {
-			time.Sleep(publishRetryBackoff)
-			err = write(s, evt)
-		}
-		if err == nil {
-			s.publishFailures.Store(0)
-			continue
-		}
-		failureCount := s.publishFailures.Add(1)
-		if failureCount >= maxConsecutivePublishFailures {
-			slog.Debug("eventstream subscriber removed after consecutive failures",
-				"remote", s.remote(),
-				"consecutive_failures", failureCount,
-				"last_error", err)
-			dead = append(dead, s)
-		} else {
-			slog.Debug("eventstream write failed, retaining subscriber",
-				"remote", s.remote(),
-				"consecutive_failures", failureCount,
-				"error", err)
-		}
+		wg.Add(1)
+		go func(s *subscriber) {
+			defer wg.Done()
+			done := make(chan error, 1)
+			go func() {
+				err := write(s, evt)
+				if err != nil {
+					time.Sleep(publishRetryBackoff)
+					err = write(s, evt)
+				}
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					s.publishFailures.Store(0)
+					return
+				}
+				if s.publishFailures.Add(1) >= maxConsecutivePublishFailures {
+					slog.Debug("eventstream subscriber removed after consecutive failures",
+						"remote", s.remote(),
+						"consecutive_failures", maxConsecutivePublishFailures,
+						"last_error", err)
+					deadMu.Lock()
+					dead = append(dead, s)
+					deadMu.Unlock()
+				}
+			case <-time.After(publishWriteTimeout):
+				if s.publishFailures.Add(1) >= maxConsecutivePublishFailures {
+					slog.Debug("eventstream subscriber removed after write timeout",
+						"remote", s.remote(),
+						"consecutive_failures", maxConsecutivePublishFailures,
+						"timeout", publishWriteTimeout)
+					deadMu.Lock()
+					dead = append(dead, s)
+					deadMu.Unlock()
+				} else {
+					slog.Debug("eventstream write timed out, retaining subscriber",
+						"remote", s.remote(),
+						"consecutive_failures", maxConsecutivePublishFailures,
+						"timeout", publishWriteTimeout)
+				}
+			}
+		}(s)
 	}
+	wg.Wait()
 	for _, s := range dead {
 		b.removeSub(s)
 	}
