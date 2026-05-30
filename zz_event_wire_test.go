@@ -143,3 +143,19 @@ func TestEventPayloadTooLarge(t *testing.T) {
 		t.Fatal("expected error for oversized payload, got nil")
 	}
 }
+
+func TestEventTopicInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	// Craft topic with invalid UTF-8: byte 0xFF is never valid
+	invalidTopic := []byte{0x48, 0xFF, 0x69} // H + invalid + i
+	binary.Write(&buf, binary.BigEndian, uint16(len(invalidTopic)))
+	buf.Write(invalidTopic)
+	// Valid payload
+	binary.Write(&buf, binary.BigEndian, uint32(0))
+
+	_, err := eventstream.ReadEvent(&buf)
+	if err == nil {
+		t.Fatal("expected error for invalid UTF-8 topic, got nil")
+	}
+}

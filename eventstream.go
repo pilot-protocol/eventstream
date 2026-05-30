@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"unicode/utf8"
 )
 
 // Event is a typed message published to the event stream.
@@ -56,6 +57,10 @@ func ReadEvent(r io.Reader) (*Event, error) {
 	payload := make([]byte, pl)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
+	}
+
+	if !utf8.Valid(topic) {
+		return nil, fmt.Errorf("topic contains invalid UTF-8")
 	}
 
 	return &Event{Topic: string(topic), Payload: payload}, nil
