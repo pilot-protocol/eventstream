@@ -38,6 +38,12 @@ const (
 	publishWriteTimeout           = 5 * time.Second
 )
 
+// maxSubsPerTopic caps the number of subscribers per topic to prevent
+// memory-DoS via unlimited b.subs[topic] growth. A peer with many keys
+// can otherwise open connections subscribing to the same topic without
+// bound, growing the subscriber slice linearly.
+const maxSubsPerTopic = 1000
+
 // Service is the L11 plugin adapter. cmd/daemon/main.go (L12) and
 // cmd/pilotctl _daemon-run construct it via NewService and register
 // via daemon.RegisterPlugin.
@@ -228,8 +234,15 @@ func (b *broker) handleConn(sub *subscriber) {
 		return
 	}
 	slog.Info("eventstream broker: subscribe received", "remote", sub.remote(), "topic", subEvt.Topic)
-	topic = subEvt.Topic
-	b.addSub(topic, sub)
+	reqTopic := subEvt.Topic
+	if !b.addSub(reqTopic, sub) {
+		slog.Warn("eventstream broker: subscriber rejected, topic at cap",
+			"remote", sub.remote(),
+			"topic", reqTopic,
+			"cap", maxSubsPerTopic)
+		return
+	}
+	topic = reqTopic
 	if b.events != nil {
 		b.events.Publish("pubsub.subscribed", map[string]any{
 			"topic": topic, "remote": sub.remote(),
@@ -259,10 +272,14 @@ func (b *broker) handleConn(sub *subscriber) {
 	}
 }
 
-func (b *broker) addSub(topic string, sub *subscriber) {
+func (b *broker) addSub(topic string, sub *subscriber) bool {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.subs[topic]) >= maxSubsPerTopic {
+		return false
+	}
 	b.subs[topic] = append(b.subs[topic], sub)
-	b.mu.Unlock()
+	return true
 }
 
 func (b *broker) removeSub(sub *subscriber) {

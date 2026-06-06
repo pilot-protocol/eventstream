@@ -447,6 +447,41 @@ func TestService_StopContextCancel(t *testing.T) {
 
 // --- takeToken cap branch ----------------------------------------------------
 
+// TestBroker_AddSub_RejectsAtCap verifies that addSub returns false when
+// the per-topic subscriber cap is reached (memory-DoS protection).
+func TestBroker_AddSub_RejectsAtCap(t *testing.T) {
+	t.Parallel()
+	b := newBroker(nil)
+	// Seed the topic with exactly maxSubsPerTopic subscribers.
+	for i := 0; i < maxSubsPerTopic; i++ {
+		sub := stubSubscriber()
+		if !b.addSub("full-topic", sub) {
+			t.Fatalf("addSub #%d failed before cap", i)
+		}
+	}
+	// The next subscriber must be rejected.
+	extra := stubSubscriber()
+	if b.addSub("full-topic", extra) {
+		t.Fatal("addSub should have rejected subscriber over cap")
+	}
+	// A different topic should still accept subscribers (no cross-topic bleed).
+	other := stubSubscriber()
+	if !b.addSub("other-topic", other) {
+		t.Fatal("addSub rejected subscriber on a topic well below cap")
+	}
+	// Verify counts.
+	b.mu.RLock()
+	nFull := len(b.subs["full-topic"])
+	nOther := len(b.subs["other-topic"])
+	b.mu.RUnlock()
+	if nFull != maxSubsPerTopic {
+		t.Errorf("full-topic subscribers = %d, want %d", nFull, maxSubsPerTopic)
+	}
+	if nOther != 1 {
+		t.Errorf("other-topic subscribers = %d, want 1", nOther)
+	}
+}
+
 // TestTakeToken_RefillCappedAtBurst exercises the refill cap (line
 // 179-180): after a long sleep the refill would exceed the burst budget,
 // so it must be clamped.
