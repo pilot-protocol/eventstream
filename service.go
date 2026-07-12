@@ -73,7 +73,7 @@ func (s *Service) Start(ctx context.Context, deps coreapi.Deps) error {
 		return fmt.Errorf("eventstream: listen on port %d: %w", protocol.PortEventStream, err)
 	}
 	s.listener = ln
-	s.broker = newBroker(deps.Events)
+	s.broker = newBroker(deps.Events, deps.Trust)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
@@ -154,12 +154,14 @@ type broker struct {
 	rateMu sync.Mutex
 	rate   map[*subscriber]*publishBucket
 	events coreapi.EventBus // for pubsub.* observability events
+	trust  coreapi.TrustChecker // optional — nil means no trust gate loaded
 }
 
-func newBroker(events coreapi.EventBus) *broker {
+func newBroker(events coreapi.EventBus, trust coreapi.TrustChecker) *broker {
 	return &broker{
 		subs:   make(map[string][]*subscriber),
 		events: events,
+		trust:  trust,
 	}
 }
 
@@ -234,6 +236,20 @@ func (b *broker) handleConn(sub *subscriber) {
 		return
 	}
 	slog.Info("eventstream broker: subscribe received", "remote", sub.remote(), "topic", subEvt.Topic)
+
+	// Auth gate (PILOT-251): when a TrustChecker is loaded (trustedagents
+	// plugin registered), reject subscription if the peer is NOT on the
+	// allowlist. When trust is nil (trustedagents not loaded), fall back
+	// to the previous behavior — allow all — for backward compatibility.
+	nodeID := sub.conn.RemoteAddr().Node
+	if b.trust != nil {
+		if _, ok := b.trust.IsTrusted(nodeID); !ok {
+			slog.Warn("eventstream broker: rejecting subscription — peer not trusted",
+				"remote", sub.remote(), "topic", subEvt.Topic, "nodeID", nodeID)
+			return
+		}
+	}
+
 	reqTopic := subEvt.Topic
 	if !b.addSub(reqTopic, sub) {
 		slog.Warn("eventstream broker: subscriber rejected, topic at cap",

@@ -55,7 +55,7 @@ func TestNewSubscriber_NilWrap(t *testing.T) {
 // without going through handleConn.
 func TestBrokerAddRemoveSub_DirectCalls(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	sub1 := stubSubscriber()
 	sub2 := stubSubscriber()
 
@@ -89,7 +89,7 @@ func TestBrokerAddRemoveSub_DirectCalls(t *testing.T) {
 // publisher's bucket should be gone after the call.
 func TestBrokerForgetPublisher(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	sub := stubSubscriber()
 	// Prime the bucket.
 	if !b.takeToken(sub) {
@@ -107,7 +107,7 @@ func TestBrokerForgetPublisher(t *testing.T) {
 // TestTakeToken_BurstAndRecover exercises the rate-limit drain + refill.
 func TestTakeToken_BurstAndRecover(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	sub := stubSubscriber()
 	// Drain the entire burst budget.
 	drained := 0

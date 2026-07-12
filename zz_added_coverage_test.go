@@ -100,7 +100,7 @@ func (s *pipeStream) SetWriteDeadline(time.Time) error { return nil }
 func TestBroker_HandleConn_SubscribeEmitsEvent(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, nil)
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -153,7 +153,7 @@ func TestBroker_HandleConn_SubscribeEmitsEvent(t *testing.T) {
 func TestBroker_HandleConn_SubscribeReadFails(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, nil)
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -190,7 +190,7 @@ func TestBroker_HandleConn_SubscribeReadFails(t *testing.T) {
 func TestBroker_HandleConn_PublishedEventBusBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, nil)
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -248,7 +248,7 @@ func TestBroker_HandleConn_PublishedEventBusBranch(t *testing.T) {
 func TestBroker_HandleConn_RateLimitBusBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, nil)
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -315,7 +315,7 @@ func TestBroker_HandleConn_RateLimitBusBranch(t *testing.T) {
 // (lines 312-315 — wildcard subscriber receives non-wildcard event).
 func TestPublishWith_WildcardFanout(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 
 	topicSub := stubSubscriber()
 	wildSub := stubSubscriber()
@@ -348,7 +348,7 @@ func TestPublishWith_WildcardFanout(t *testing.T) {
 // should not receive its own publish.
 func TestPublishWith_WildcardSenderSkipped(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 
 	wildSender := stubSubscriber()
 	wildOther := stubSubscriber()
@@ -381,7 +381,7 @@ func TestPublishWith_WildcardSenderSkipped(t *testing.T) {
 // otherwise double-deliver).
 func TestPublishWith_TopicIsWildcardDoesNotDoubleDeliver(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	wildSub := stubSubscriber()
 	b.addSub("*", wildSub)
 
@@ -408,7 +408,7 @@ func TestPublishWith_TopicIsWildcardDoesNotDoubleDeliver(t *testing.T) {
 func TestPublishWith_BusPublishedBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, nil)
 	sub := stubSubscriber()
 	b.addSub("t", sub)
 
@@ -451,7 +451,7 @@ func TestService_StopContextCancel(t *testing.T) {
 // the per-topic subscriber cap is reached (memory-DoS protection).
 func TestBroker_AddSub_RejectsAtCap(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	// Seed the topic with exactly maxSubsPerTopic subscribers.
 	for i := 0; i < maxSubsPerTopic; i++ {
 		sub := stubSubscriber()
@@ -487,7 +487,7 @@ func TestBroker_AddSub_RejectsAtCap(t *testing.T) {
 // so it must be clamped.
 func TestTakeToken_RefillCappedAtBurst(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, nil)
 	sub := stubSubscriber()
 
 	// Seed a bucket with a lastRefill far in the past so the elapsed
@@ -661,6 +661,127 @@ func TestServer_Publish_WildcardSenderSkipped(t *testing.T) {
 	}
 	if got.Topic != "evt" {
 		t.Errorf("Topic = %q", got.Topic)
+	}
+}
+
+// --- Trust gate (PILOT-251) ------------------------------------------------
+
+// stubTrustChecker is a test double that reports a fixed set of trusted
+// node IDs.
+type stubTrustChecker struct {
+	mu      sync.Mutex
+	trusted map[uint32]string
+}
+
+func (stc *stubTrustChecker) IsTrusted(nodeID uint32) (string, bool) {
+	stc.mu.Lock()
+	defer stc.mu.Unlock()
+	name, ok := stc.trusted[nodeID]
+	return name, ok
+}
+
+func (stc *stubTrustChecker) setTrusted(nodeIDs ...uint32) {
+	stc.mu.Lock()
+	defer stc.mu.Unlock()
+	if stc.trusted == nil {
+		stc.trusted = make(map[uint32]string)
+	}
+	for _, id := range nodeIDs {
+		stc.trusted[id] = "test-peer"
+	}
+}
+
+// TestBroker_HandleConn_TrustGateRejectsUntrusted verifies that
+// handleConn rejects a subscriber whose node ID is not trusted when
+// the broker has a TrustChecker.
+func TestBroker_HandleConn_TrustGateRejectsUntrusted(t *testing.T) {
+	t.Parallel()
+
+	// Broker with a trust checker that has NO trusted peers.
+	tc := &stubTrustChecker{}
+	b := newBroker(nil, tc)
+
+	subStream, clientEnd := newPipeStreamPair()
+	sub := newSubscriber(subStream)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.handleConn(sub)
+	}()
+
+	// Client writes subscribe event.
+	if err := WriteEvent(clientEnd, &Event{Topic: "secret"}); err != nil {
+		t.Fatalf("WriteEvent subscribe: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn should have returned after rejecting untrusted subscriber")
+	}
+
+	// The subscriber must NOT have been added.
+	b.mu.RLock()
+	n := len(b.subs["secret"])
+	b.mu.RUnlock()
+	if n != 0 {
+		t.Errorf("untrusted peer added to subs, got %d subscribers, want 0", n)
+	}
+
+	_ = clientEnd.Close()
+}
+
+// TestBroker_HandleConn_TrustGateAcceptsTrusted verifies that handleConn
+// accepts a subscriber whose node ID matches the trusted allowlist.
+func TestBroker_HandleConn_TrustGateAcceptsTrusted(t *testing.T) {
+	t.Parallel()
+
+	// Broker with a trust checker that trusts our peer (Node = 0xBEEF
+	// from pipeStream stub).
+	tc := &stubTrustChecker{}
+	tc.setTrusted(0xBEEF)
+	b := newBroker(nil, tc)
+
+	subStream, clientEnd := newPipeStreamPair()
+	sub := newSubscriber(subStream)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.handleConn(sub)
+	}()
+
+	// Client writes subscribe event.
+	if err := WriteEvent(clientEnd, &Event{Topic: "public"}); err != nil {
+		t.Fatalf("WriteEvent subscribe: %v", err)
+	}
+
+	// Wait for subscription to be registered.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b.mu.RLock()
+		n := len(b.subs["public"])
+		b.mu.RUnlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	b.mu.RLock()
+	n := len(b.subs["public"])
+	b.mu.RUnlock()
+	if n != 1 {
+		t.Errorf("trusted peer NOT added to subs, got %d subscribers, want 1", n)
+	}
+
+	// Close to let handleConn exit.
+	_ = clientEnd.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not return after client close")
 	}
 }
 
