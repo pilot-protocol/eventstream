@@ -44,20 +44,49 @@ const (
 // bound, growing the subscriber slice linearly.
 const maxSubsPerTopic = 1000
 
+// TopicPolicy is the authorization gate for topic subscription.
+// Implementations check whether a peer (identified by its 48-bit
+// virtual address) may subscribe to a given topic.
+//
+// The defaultAllowPolicy permits all subscriptions (backward
+// compatible). Daemon-level callers that need topic-level access
+// control provide a restricted implementation via SetTopicPolicy.
+type TopicPolicy interface {
+	// AllowSubscribe returns true if the peer at remoteAddr is
+	// permitted to subscribe to the named topic.
+	AllowSubscribe(remoteAddr coreapi.Addr, topic string) bool
+}
+
+// defaultAllowPolicy permits all subscriptions. Used when no
+// TopicPolicy has been set.
+type defaultAllowPolicy struct{}
+
+func (defaultAllowPolicy) AllowSubscribe(_ coreapi.Addr, _ string) bool { return true }
+
 // Service is the L11 plugin adapter. cmd/daemon/main.go (L12) and
 // cmd/pilotctl _daemon-run construct it via NewService and register
 // via daemon.RegisterPlugin.
 type Service struct {
-	listener coreapi.Listener
-	deps     coreapi.Deps
-	cancel   context.CancelFunc
-	done     chan struct{}
-	broker   *broker
+	listener    coreapi.Listener
+	deps        coreapi.Deps
+	cancel      context.CancelFunc
+	done        chan struct{}
+	broker      *broker
+	topicPolicy TopicPolicy
 }
 
 // NewService returns a Service ready for daemon.RegisterPlugin.
 func NewService() *Service {
-	return &Service{}
+	return &Service{topicPolicy: defaultAllowPolicy{}}
+}
+
+// SetTopicPolicy installs a TopicPolicy for subscription authorization.
+// Must be called before Start. A nil value is ignored (policy stays at
+// the previous setting, which defaults to allow-all).
+func (s *Service) SetTopicPolicy(p TopicPolicy) {
+	if p != nil {
+		s.topicPolicy = p
+	}
 }
 
 func (s *Service) Name() string { return "eventstream" }
@@ -73,7 +102,7 @@ func (s *Service) Start(ctx context.Context, deps coreapi.Deps) error {
 		return fmt.Errorf("eventstream: listen on port %d: %w", protocol.PortEventStream, err)
 	}
 	s.listener = ln
-	s.broker = newBroker(deps.Events)
+	s.broker = newBroker(deps.Events, s.topicPolicy)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
@@ -149,17 +178,19 @@ func (s *subscriber) remote() string {
 // Service; one instance per daemon. Tracks subscribers by topic plus
 // per-publisher rate buckets.
 type broker struct {
-	mu     sync.RWMutex
-	subs   map[string][]*subscriber
-	rateMu sync.Mutex
-	rate   map[*subscriber]*publishBucket
-	events coreapi.EventBus // for pubsub.* observability events
+	mu          sync.RWMutex
+	subs        map[string][]*subscriber
+	rateMu      sync.Mutex
+	rate        map[*subscriber]*publishBucket
+	events      coreapi.EventBus // for pubsub.* observability events
+	topicPolicy TopicPolicy
 }
 
-func newBroker(events coreapi.EventBus) *broker {
+func newBroker(events coreapi.EventBus, policy TopicPolicy) *broker {
 	return &broker{
-		subs:   make(map[string][]*subscriber),
-		events: events,
+		subs:        make(map[string][]*subscriber),
+		events:      events,
+		topicPolicy: policy,
 	}
 }
 
@@ -235,6 +266,23 @@ func (b *broker) handleConn(sub *subscriber) {
 	}
 	slog.Info("eventstream broker: subscribe received", "remote", sub.remote(), "topic", subEvt.Topic)
 	reqTopic := subEvt.Topic
+
+	// Topic-level authorization gate (SECURITY_PLAN AI-016).
+	// The topic policy defaults to allow-all for backward compatibility;
+	// daemon-level callers can install a restricted policy via
+	// Service.SetTopicPolicy.
+	if !b.topicPolicy.AllowSubscribe(sub.conn.RemoteAddr(), reqTopic) {
+		slog.Warn("eventstream broker: subscribe denied by topic policy",
+			"remote", sub.remote(),
+			"topic", reqTopic)
+		if b.events != nil {
+			b.events.Publish("pubsub.subscribe_denied", map[string]any{
+				"topic": reqTopic, "remote": sub.remote(),
+			})
+		}
+		return
+	}
+
 	if !b.addSub(reqTopic, sub) {
 		slog.Warn("eventstream broker: subscriber rejected, topic at cap",
 			"remote", sub.remote(),

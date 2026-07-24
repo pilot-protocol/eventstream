@@ -47,7 +47,7 @@ func stubSubscriber() *subscriber {
 // the retry succeeds — subscriber stays alive, counter never increments.
 func TestPubsubRetryAbsorbsSingleTransientFailure(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	sub := stubSubscriber()
 	b.addSub("topic-a", sub)
 
@@ -73,7 +73,7 @@ func TestPubsubRetryAbsorbsSingleTransientFailure(t *testing.T) {
 // maxConsecutivePublishFailures across publishes.
 func TestPubsubKeepsSubscriberBelowFailureThreshold(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	sub := stubSubscriber()
 	b.addSub("topic-fail", sub)
 
@@ -107,7 +107,7 @@ func TestPubsubKeepsSubscriberBelowFailureThreshold(t *testing.T) {
 // counter restarted from 0, threshold is 3).
 func TestPubsubFailureCounterResetsOnSuccess(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	sub := stubSubscriber()
 	b.addSub("topic-mix", sub)
 
@@ -151,7 +151,7 @@ func TestPubsubFailureCounterResetsOnSuccess(t *testing.T) {
 // the flaky sub drops.
 func TestPubsubOneSubscribersFailureDoesNotKillOthers(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	healthy := stubSubscriber()
 	flaky := stubSubscriber()
 	b.addSub("shared", healthy)

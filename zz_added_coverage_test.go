@@ -100,7 +100,7 @@ func (s *pipeStream) SetWriteDeadline(time.Time) error { return nil }
 func TestBroker_HandleConn_SubscribeEmitsEvent(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, defaultAllowPolicy{})
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -153,7 +153,7 @@ func TestBroker_HandleConn_SubscribeEmitsEvent(t *testing.T) {
 func TestBroker_HandleConn_SubscribeReadFails(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, defaultAllowPolicy{})
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -190,7 +190,7 @@ func TestBroker_HandleConn_SubscribeReadFails(t *testing.T) {
 func TestBroker_HandleConn_PublishedEventBusBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, defaultAllowPolicy{})
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -248,7 +248,7 @@ func TestBroker_HandleConn_PublishedEventBusBranch(t *testing.T) {
 func TestBroker_HandleConn_RateLimitBusBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, defaultAllowPolicy{})
 
 	subStream, clientEnd := newPipeStreamPair()
 	sub := newSubscriber(subStream)
@@ -315,7 +315,7 @@ func TestBroker_HandleConn_RateLimitBusBranch(t *testing.T) {
 // (lines 312-315 — wildcard subscriber receives non-wildcard event).
 func TestPublishWith_WildcardFanout(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 
 	topicSub := stubSubscriber()
 	wildSub := stubSubscriber()
@@ -348,7 +348,7 @@ func TestPublishWith_WildcardFanout(t *testing.T) {
 // should not receive its own publish.
 func TestPublishWith_WildcardSenderSkipped(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 
 	wildSender := stubSubscriber()
 	wildOther := stubSubscriber()
@@ -381,7 +381,7 @@ func TestPublishWith_WildcardSenderSkipped(t *testing.T) {
 // otherwise double-deliver).
 func TestPublishWith_TopicIsWildcardDoesNotDoubleDeliver(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	wildSub := stubSubscriber()
 	b.addSub("*", wildSub)
 
@@ -408,7 +408,7 @@ func TestPublishWith_TopicIsWildcardDoesNotDoubleDeliver(t *testing.T) {
 func TestPublishWith_BusPublishedBranch(t *testing.T) {
 	t.Parallel()
 	bus := &stubEventBus{}
-	b := newBroker(bus)
+	b := newBroker(bus, defaultAllowPolicy{})
 	sub := stubSubscriber()
 	b.addSub("t", sub)
 
@@ -451,7 +451,7 @@ func TestService_StopContextCancel(t *testing.T) {
 // the per-topic subscriber cap is reached (memory-DoS protection).
 func TestBroker_AddSub_RejectsAtCap(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	// Seed the topic with exactly maxSubsPerTopic subscribers.
 	for i := 0; i < maxSubsPerTopic; i++ {
 		sub := stubSubscriber()
@@ -487,7 +487,7 @@ func TestBroker_AddSub_RejectsAtCap(t *testing.T) {
 // so it must be clamped.
 func TestTakeToken_RefillCappedAtBurst(t *testing.T) {
 	t.Parallel()
-	b := newBroker(nil)
+	b := newBroker(nil, defaultAllowPolicy{})
 	sub := stubSubscriber()
 
 	// Seed a bucket with a lastRefill far in the past so the elapsed
@@ -707,5 +707,111 @@ func TestServer_Publish_TopicLiteralStar(t *testing.T) {
 		t.Errorf("unexpected second delivery: %+v err=%v", r.ev, r.err)
 	case <-time.After(150 * time.Millisecond):
 		// expected — no second delivery.
+	}
+}
+
+// restrictPolicy denies subscription to any topic except "public.allowed".
+type restrictPolicy struct{}
+
+func (restrictPolicy) AllowSubscribe(_ coreapi.Addr, topic string) bool {
+	return topic == "public.allowed"
+}
+
+// TestBroker_HandleConn_TopicPolicyDeny verifies that a restrictive
+// TopicPolicy rejects subscription and publishes
+// pubsub.subscribe_denied instead of adding the subscriber.
+func TestBroker_HandleConn_TopicPolicyDeny(t *testing.T) {
+	t.Parallel()
+	bus := &stubEventBus{}
+	b := newBroker(bus, restrictPolicy{})
+
+	subStream, clientEnd := newPipeStreamPair()
+	sub := newSubscriber(subStream)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.handleConn(sub)
+	}()
+
+	// Subscribe to a topic that the policy forbids.
+	if err := WriteEvent(clientEnd, &Event{Topic: "forbidden"}); err != nil {
+		t.Fatalf("WriteEvent subscribe: %v", err)
+	}
+
+	// The broker must NOT add the subscriber to any topic.
+	time.Sleep(100 * time.Millisecond)
+	b.mu.RLock()
+	n := len(b.subs["forbidden"])
+	b.mu.RUnlock()
+	if n != 0 {
+		t.Errorf("forbidden topic has %d subs, want 0", n)
+	}
+
+	// The broker must have emitted pubsub.subscribe_denied.
+	if !bus.seen("pubsub.subscribe_denied") {
+		t.Errorf("expected pubsub.subscribe_denied event, got %v", bus.topics)
+	}
+
+	_ = clientEnd.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not return after client close")
+	}
+}
+
+// TestBroker_HandleConn_TopicPolicyAllow verifies that the policy
+// allows subscription when AllowSubscribe returns true.
+func TestBroker_HandleConn_TopicPolicyAllow(t *testing.T) {
+	t.Parallel()
+	bus := &stubEventBus{}
+	b := newBroker(bus, restrictPolicy{})
+
+	subStream, clientEnd := newPipeStreamPair()
+	sub := newSubscriber(subStream)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.handleConn(sub)
+	}()
+
+	// Subscribe to a topic the policy allows.
+	if err := WriteEvent(clientEnd, &Event{Topic: "public.allowed"}); err != nil {
+		t.Fatalf("WriteEvent subscribe: %v", err)
+	}
+
+	// The broker must add the subscriber to the allowed topic.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b.mu.RLock()
+		n := len(b.subs["public.allowed"])
+		b.mu.RUnlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	b.mu.RLock()
+	n := len(b.subs["public.allowed"])
+	b.mu.RUnlock()
+	if n != 1 {
+		t.Errorf("public.allowed topic has %d subs, want 1", n)
+	}
+
+	// Must have published pubsub.subscribed, not subscribe_denied.
+	if !bus.seen("pubsub.subscribed") {
+		t.Errorf("expected pubsub.subscribed event, got %v", bus.topics)
+	}
+	if bus.seen("pubsub.subscribe_denied") {
+		t.Errorf("unexpected pubsub.subscribe_denied for allowed topic")
+	}
+
+	_ = clientEnd.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not return after client close")
 	}
 }
