@@ -164,7 +164,14 @@ func newSubscriber(conn coreapi.Stream) *subscriber {
 	return &subscriber{conn: conn}
 }
 
-func (s *subscriber) Close() error { return s.conn.Close() }
+// Close releases the underlying stream. Tolerates a subscriber with no
+// stream behind it, matching remote().
+func (s *subscriber) Close() error {
+	if s.conn == nil {
+		return nil
+	}
+	return s.conn.Close()
+}
 
 func (s *subscriber) remote() string {
 	if s.conn == nil {
@@ -436,7 +443,14 @@ func (b *broker) publishWith(evt *Event, sender *subscriber, write eventWriter) 
 	}
 	wg.Wait()
 	for _, s := range dead {
+		// Full teardown, not just deregistration. The peer is by
+		// definition not draining, so its handleConn goroutine is parked
+		// in ReadEvent and any writer still blocked on the same stream
+		// stays blocked; closing the stream is what returns both, along
+		// with the descriptor and the rate-bucket entry.
 		b.removeSub(s)
+		b.forgetPublisher(s)
+		_ = s.Close()
 	}
 	slog.Info("eventstream published", "topic", evt.Topic, "bytes", len(evt.Payload), "from", sender.remote(), "targets", len(targets))
 	if b.events != nil {
