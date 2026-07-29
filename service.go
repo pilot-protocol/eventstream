@@ -408,6 +408,8 @@ func (b *broker) publishWith(evt *Event, sender *subscriber, write eventWriter) 
 				}
 				done <- err
 			}()
+			writeTimeout := time.NewTimer(publishWriteTimeout)
+			defer writeTimeout.Stop()
 			select {
 			case err := <-done:
 				if err == nil {
@@ -423,7 +425,14 @@ func (b *broker) publishWith(evt *Event, sender *subscriber, write eventWriter) 
 					dead = append(dead, s)
 					deadMu.Unlock()
 				}
-			case <-time.After(publishWriteTimeout):
+			// NewTimer + Stop, not time.After. This runs in a goroutine
+			// spawned per subscriber per event, and time.After pins its
+			// timer in the runtime heap for the full publishWriteTimeout
+			// even when the write completes immediately. At the 100 ev/s
+			// publish limit with S subscribers that is up to 500*S live
+			// timers in steady state — 50k at S=100 — purely as GC and
+			// timer-heap pressure.
+			case <-writeTimeout.C:
 				if s.publishFailures.Add(1) >= maxConsecutivePublishFailures {
 					slog.Debug("eventstream subscriber removed after write timeout",
 						"remote", s.remote(),
