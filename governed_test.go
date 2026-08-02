@@ -71,6 +71,10 @@ func TestGovernedPublicationContentInspectionRunsBeforeFanout(t *testing.T) {
 	defer senderClient.Close()
 	broker := newBroker(nil, defaultAllowPolicy{})
 	broker.governedVerifier = verifier
+	// Reuses one envelope to re-run inspection with a failing scanner; the
+	// replay guard (tested separately) would reject the second identical
+	// delivery first.
+	broker.replay = nil
 	var observed []byte
 	broker.contentInspector = eventContentInspectorFunc(func(_ context.Context, intent decision.Intent, disclosure *decision.DisclosureBinding, contentType, filename string, content io.Reader) error {
 		if intent.ID != governed.Intent.ID || disclosure != nil || contentType != "application/octet-stream" || filename != "" {
@@ -107,6 +111,11 @@ func TestGovernedPublicationQuotaUsesSignedAgentIdentity(t *testing.T) {
 	broker := newBroker(nil, defaultAllowPolicy{})
 	broker.governedVerifier = verifier
 	broker.governedTransferQuota = limiter
+	// This test reuses one signed envelope to exercise quota accumulation for
+	// the same agent; the receiver-side replay guard (covered by
+	// TestGovernedPublicationReplayGuard) would otherwise reject the second
+	// delivery of the identical intent first.
+	broker.replay = nil
 	if _, err := broker.governPublication(newSubscriber(senderServer), envelope); err != nil {
 		t.Fatal(err)
 	}

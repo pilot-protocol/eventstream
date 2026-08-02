@@ -253,6 +253,7 @@ type broker struct {
 	contentInspector         decision.DisclosureContentInspector
 	requireContentInspection bool
 	governedTransferQuota    *decision.TransferQuotaLimiter
+	replay                   *governedReplayGuard
 }
 
 func newBroker(events coreapi.EventBus, policy TopicPolicy) *broker {
@@ -260,6 +261,7 @@ func newBroker(events coreapi.EventBus, policy TopicPolicy) *broker {
 		subs:        make(map[string][]*subscriber),
 		events:      events,
 		topicPolicy: policy,
+		replay:      newGovernedReplayGuard(),
 	}
 }
 
@@ -442,6 +444,12 @@ func (b *broker) governPublication(sub *subscriber, event *Event) (*Event, error
 	}
 	if err := b.governedVerifier.VerifyGovernedEvent(context.Background(), sub.conn.RemoteAddr(), governed); err != nil {
 		return nil, err
+	}
+	if b.replay != nil {
+		if err := b.replay.admit(governed.Intent); err != nil {
+			slog.Warn("eventstream governed publication replay rejected", "agent_id", governed.Intent.AgentID, "intent_id", governed.Intent.ID, "error", err)
+			return nil, fmt.Errorf("eventstream: %w", err)
+		}
 	}
 	if b.governedTransferQuota != nil {
 		if err := b.governedTransferQuota.Allow(governed.Intent.AgentID, uint64(len(governed.Payload))); err != nil {
