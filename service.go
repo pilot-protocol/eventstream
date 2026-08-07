@@ -6,13 +6,16 @@
 package eventstream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
 	"github.com/pilot-protocol/common/coreapi"
+	"github.com/pilot-protocol/common/decision"
 	"github.com/pilot-protocol/common/protocol"
 )
 
@@ -44,19 +47,6 @@ const (
 // bound, growing the subscriber slice linearly.
 const maxSubsPerTopic = 1000
 
-// TopicPolicy is the authorization gate for topic subscription.
-// Implementations check whether a peer (identified by its 48-bit
-// virtual address) may subscribe to a given topic.
-//
-// The defaultAllowPolicy permits all subscriptions (backward
-// compatible). Daemon-level callers that need topic-level access
-// control provide a restricted implementation via SetTopicPolicy.
-type TopicPolicy interface {
-	// AllowSubscribe returns true if the peer at remoteAddr is
-	// permitted to subscribe to the named topic.
-	AllowSubscribe(remoteAddr coreapi.Addr, topic string) bool
-}
-
 // defaultAllowPolicy permits all subscriptions. Used when no
 // TopicPolicy has been set.
 type defaultAllowPolicy struct{}
@@ -67,12 +57,19 @@ func (defaultAllowPolicy) AllowSubscribe(_ coreapi.Addr, _ string) bool { return
 // cmd/pilotctl _daemon-run construct it via NewService and register
 // via daemon.RegisterPlugin.
 type Service struct {
-	listener    coreapi.Listener
-	deps        coreapi.Deps
-	cancel      context.CancelFunc
-	done        chan struct{}
-	broker      *broker
-	topicPolicy TopicPolicy
+	listener                 coreapi.Listener
+	deps                     coreapi.Deps
+	cancel                   context.CancelFunc
+	done                     chan struct{}
+	broker                   *broker
+	topicPolicy              TopicPolicy
+	governedVerifier         GovernedEventVerifier
+	requireGoverned          bool
+	receiptRecorder          GovernedReceiptRecorder
+	requireReceipts          bool
+	contentInspector         decision.DisclosureContentInspector
+	requireContentInspection bool
+	governedTransferQuota    *decision.TransferQuotaLimiter
 }
 
 // NewService returns a Service ready for daemon.RegisterPlugin.
@@ -89,6 +86,45 @@ func (s *Service) SetTopicPolicy(p TopicPolicy) {
 	}
 }
 
+// SetGovernedPublication configures the broker-side authorization gate for
+// published events. When require is true every publication must be a signed
+// governed envelope. Call before Start; a required gate without a verifier
+// makes Start fail closed.
+func (s *Service) SetGovernedPublication(verifier GovernedEventVerifier, require bool) {
+	s.governedVerifier = verifier
+	s.requireGoverned = require
+}
+
+// SetGovernedReceiptRecorder attaches a durable evidence recorder to governed
+// publications. When require is true the broker refuses to start without both
+// a required governed gate and this recorder.
+func (s *Service) SetGovernedReceiptRecorder(recorder GovernedReceiptRecorder, require bool) {
+	s.receiptRecorder = recorder
+	s.requireReceipts = require
+}
+
+// SetGovernedContentInspector installs a receiver-local DLP hook. It runs
+// after a signed governed envelope has passed its local policy ceiling and
+// before the event reaches subscribers. The hook receives a reader over the
+// event bytes; it never runs in the central decision authority.
+func (s *Service) SetGovernedContentInspector(inspector decision.DisclosureContentInspector) {
+	s.contentInspector = inspector
+}
+
+// RequireGovernedContentInspection makes startup fail closed when a local DLP
+// hook is absent. Call this from the enterprise attachment after an operator
+// has supplied the tenant-local inspector.
+func (s *Service) RequireGovernedContentInspection(require bool) {
+	s.requireContentInspection = require
+}
+
+// SetGovernedTransferQuota installs a receiver-local per-agent admission
+// quota. It is charged only after a signed governed event verifies, using the
+// signed Intent.AgentID rather than a transport address.
+func (s *Service) SetGovernedTransferQuota(limiter *decision.TransferQuotaLimiter) {
+	s.governedTransferQuota = limiter
+}
+
 func (s *Service) Name() string { return "eventstream" }
 
 // Order: 120 — after the trust subsystem (50) and other application
@@ -96,6 +132,18 @@ func (s *Service) Name() string { return "eventstream" }
 func (s *Service) Order() int { return 120 }
 
 func (s *Service) Start(ctx context.Context, deps coreapi.Deps) error {
+	if s.requireGoverned && s.governedVerifier == nil {
+		return fmt.Errorf("eventstream: governed publication is required but no verifier is configured")
+	}
+	if s.requireReceipts && (!s.requireGoverned || s.receiptRecorder == nil) {
+		return fmt.Errorf("eventstream: governed receipts require a governed broker and receipt recorder")
+	}
+	if s.requireContentInspection && (!s.requireGoverned || s.contentInspector == nil) {
+		return fmt.Errorf("eventstream: required content inspection needs a governed broker and local inspector")
+	}
+	if s.governedTransferQuota != nil && !s.requireGoverned {
+		return fmt.Errorf("eventstream: governed transfer quota requires a governed broker")
+	}
 	s.deps = deps
 	ln, err := deps.Streams.Listen(protocol.PortEventStream)
 	if err != nil {
@@ -103,6 +151,13 @@ func (s *Service) Start(ctx context.Context, deps coreapi.Deps) error {
 	}
 	s.listener = ln
 	s.broker = newBroker(deps.Events, s.topicPolicy)
+	s.broker.governedVerifier = s.governedVerifier
+	s.broker.requireGoverned = s.requireGoverned
+	s.broker.receiptRecorder = s.receiptRecorder
+	s.broker.requireReceipts = s.requireReceipts
+	s.broker.contentInspector = s.contentInspector
+	s.broker.requireContentInspection = s.requireContentInspection
+	s.broker.governedTransferQuota = s.governedTransferQuota
 
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
@@ -185,12 +240,20 @@ func (s *subscriber) remote() string {
 // Service; one instance per daemon. Tracks subscribers by topic plus
 // per-publisher rate buckets.
 type broker struct {
-	mu          sync.RWMutex
-	subs        map[string][]*subscriber
-	rateMu      sync.Mutex
-	rate        map[*subscriber]*publishBucket
-	events      coreapi.EventBus // for pubsub.* observability events
-	topicPolicy TopicPolicy
+	mu                       sync.RWMutex
+	subs                     map[string][]*subscriber
+	rateMu                   sync.Mutex
+	rate                     map[*subscriber]*publishBucket
+	events                   coreapi.EventBus // for pubsub.* observability events
+	topicPolicy              TopicPolicy
+	governedVerifier         GovernedEventVerifier
+	requireGoverned          bool
+	receiptRecorder          GovernedReceiptRecorder
+	requireReceipts          bool
+	contentInspector         decision.DisclosureContentInspector
+	requireContentInspection bool
+	governedTransferQuota    *decision.TransferQuotaLimiter
+	replay                   *governedReplayGuard
 }
 
 func newBroker(events coreapi.EventBus, policy TopicPolicy) *broker {
@@ -198,6 +261,7 @@ func newBroker(events coreapi.EventBus, policy TopicPolicy) *broker {
 		subs:        make(map[string][]*subscriber),
 		events:      events,
 		topicPolicy: policy,
+		replay:      newGovernedReplayGuard(),
 	}
 }
 
@@ -323,8 +387,87 @@ func (b *broker) handleConn(sub *subscriber) {
 			}
 			continue
 		}
-		b.publish(evt, sub)
+		published, governErr := b.governPublication(sub, evt)
+		if governErr != nil {
+			slog.Warn("eventstream broker: publication denied", "remote", sub.remote(), "err", governErr)
+			if b.events != nil {
+				b.events.Publish("pubsub.publish_denied", map[string]any{
+					"topic": evt.Topic, "from": sub.remote(),
+				})
+			}
+			continue
+		}
+		if evt.Topic == GovernedTopic && b.receiptRecorder != nil {
+			governed, decodeErr := DecodeGovernedEvent(evt)
+			if decodeErr != nil {
+				// governPublication already successfully decoded and verified this
+				// envelope. Keep a defensive failure boundary here in case this
+				// code changes independently in the future.
+				slog.Error("eventstream broker: verified envelope could not be reconstructed for receipt", "remote", sub.remote(), "err", decodeErr)
+				continue
+			}
+			if receiptErr := recordGovernedReceipt(context.Background(), b.receiptRecorder, governed.Intent, governed.Decision, governed.Disclosure); receiptErr != nil {
+				slog.Warn("eventstream broker: publication receipt failed", "remote", sub.remote(), "err", receiptErr)
+				if b.events != nil {
+					b.events.Publish("pubsub.publish_denied", map[string]any{
+						"topic": evt.Topic, "from": sub.remote(), "reason": "receipt_failed",
+					})
+				}
+				continue
+			}
+		} else if evt.Topic == GovernedTopic && b.requireReceipts {
+			// Start rejects this configuration, but preserve a per-publication
+			// fail-closed check for direct broker construction in tests or embedders.
+			slog.Warn("eventstream broker: publication receipt recorder is unavailable", "remote", sub.remote())
+			continue
+		}
+		b.publish(published, sub)
 	}
+}
+
+// governPublication unwraps and verifies the reserved envelope before fanout.
+// Even while legacy publishing remains allowed, a peer cannot use the reserved
+// topic to bypass verification or expose envelope contents to subscribers.
+func (b *broker) governPublication(sub *subscriber, event *Event) (*Event, error) {
+	if event.Topic != GovernedTopic {
+		if b.requireGoverned {
+			return nil, fmt.Errorf("unsigned legacy publication rejected by governed broker")
+		}
+		return event, nil
+	}
+	if b.governedVerifier == nil {
+		return nil, fmt.Errorf("governed publication received but no verifier is configured")
+	}
+	governed, err := DecodeGovernedEvent(event)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.governedVerifier.VerifyGovernedEvent(context.Background(), sub.conn.RemoteAddr(), governed); err != nil {
+		return nil, err
+	}
+	if b.replay != nil {
+		if err := b.replay.admit(governed.Intent); err != nil {
+			slog.Warn("eventstream governed publication replay rejected", "agent_id", governed.Intent.AgentID, "intent_id", governed.Intent.ID, "error", err)
+			return nil, fmt.Errorf("eventstream: %w", err)
+		}
+	}
+	if b.governedTransferQuota != nil {
+		if err := b.governedTransferQuota.Allow(governed.Intent.AgentID, uint64(len(governed.Payload))); err != nil {
+			slog.Warn("eventstream governed transfer quota rejected", "agent_id", governed.Intent.AgentID, "bytes", len(governed.Payload), "error", err)
+			return nil, fmt.Errorf("eventstream: governed transfer quota rejected")
+		}
+	}
+	if b.contentInspector != nil {
+		contentType := "application/octet-stream"
+		if governed.Disclosure != nil {
+			contentType = governed.Disclosure.ContentType
+		}
+		if err := b.contentInspector.InspectDisclosureContent(context.Background(), governed.Intent, governed.Disclosure, contentType, "", bytes.NewReader(governed.Payload)); err != nil {
+			slog.Warn("eventstream governed content inspection rejected", "action", governed.Intent.Action, "resource", governed.Intent.Resource, "error", err)
+			return nil, fmt.Errorf("eventstream: governed content inspection rejected")
+		}
+	}
+	return governed.Event(), nil
 }
 
 func (b *broker) addSub(topic string, sub *subscriber) bool {

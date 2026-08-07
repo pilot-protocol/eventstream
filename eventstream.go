@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"unicode/utf8"
+
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // Event is a typed message published to the event stream.
@@ -14,6 +16,14 @@ import (
 type Event struct {
 	Topic   string
 	Payload []byte
+}
+
+// TopicPolicy is the authorization gate for topic subscription.
+// Implementations check whether a peer may subscribe to a named topic.
+// The enabled service uses an allow-all policy unless its caller installs a
+// stricter implementation.
+type TopicPolicy interface {
+	AllowSubscribe(remoteAddr coreapi.Addr, topic string) bool
 }
 
 // WriteEvent writes an event to a writer.

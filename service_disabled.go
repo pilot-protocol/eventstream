@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/pilot-protocol/common/coreapi"
+	"github.com/pilot-protocol/common/decision"
 )
 
 // Service is a no-op replacement for the real plugin Service.
@@ -22,6 +23,18 @@ type Service struct{}
 // NewService returns a disabled eventstream stub. Same signature as
 // the real NewService.
 func NewService() *Service { return &Service{} }
+
+// SetTopicPolicy, SetGovernedPublication, and SetGovernedReceiptRecorder preserve the enabled Service API
+// in a no_eventstream build. Neither has an effect while the plugin is off.
+func (s *Service) SetTopicPolicy(_ TopicPolicy)                                 {}
+func (s *Service) SetGovernedPublication(_ GovernedEventVerifier, _ bool)       {}
+func (s *Service) SetGovernedReceiptRecorder(_ GovernedReceiptRecorder, _ bool) {}
+
+func (s *Service) SetGovernedContentInspector(_ decision.DisclosureContentInspector) {}
+
+func (s *Service) RequireGovernedContentInspection(_ bool) {}
+
+func (s *Service) SetGovernedTransferQuota(_ *decision.TransferQuotaLimiter) {}
 
 func (s *Service) Name() string                                  { return "eventstream-disabled" }
 func (s *Service) Order() int                                    { return 120 }
